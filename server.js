@@ -56,7 +56,9 @@ function generateCodeString() {
 
 const app = express();
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json());
+// Accept both application/json and text/plain bodies (frontend uses text/plain
+// to avoid CORS preflight requests).
+app.use(express.json({ type: ['application/json', 'text/plain'] }));
 
 function requireAdmin(req, res, next) {
   const secret = req.headers['x-admin-secret'] || req.query.secret;
