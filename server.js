@@ -4,6 +4,8 @@ import mongoose from 'mongoose';
 
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'PRINCE-ADMIN-2025';
 const MONGO_URL = process.env.MONGO_URL;
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
+const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID;
 const PORT = Number(process.env.PORT) || 3000;
 
 if (!MONGO_URL) {
@@ -16,11 +18,21 @@ const AccessCode = mongoose.model('AccessCode', new mongoose.Schema({
   createdAt: { type: Date, default: () => new Date() },
   usedAt: { type: Date },
   discordUsername: { type: String },
+  discordId: { type: String },
+  discordDisplayName: { type: String },
+  discordAvatarUrl: { type: String },
+  discordAccountCreated: { type: Date },
+  discordJoinedServer: { type: Date },
 }));
 
 const Session = mongoose.model('Session', new mongoose.Schema({
   code: { type: String, required: true, unique: true, index: true },
   discordUsername: { type: String, required: true, index: true },
+  discordId: { type: String, index: true },
+  discordDisplayName: { type: String },
+  discordAvatarUrl: { type: String },
+  discordAccountCreated: { type: Date },
+  discordJoinedServer: { type: Date },
   username: { type: String, default: 'Guest' },
   displayName: { type: String },
   balance: { type: Number, default: 1000000 },
@@ -54,10 +66,52 @@ function generateCodeString() {
   return `${group()}-${group()}-${group()}-${group()}`;
 }
 
+// Snowflake → creation date (Discord IDs encode timestamp in upper bits)
+function snowflakeToDate(id) {
+  const DISCORD_EPOCH = 1420070400000n;
+  return new Date(Number((BigInt(id) >> 22n) + DISCORD_EPOCH));
+}
+
+/**
+ * Search the configured Discord guild for a member by username (case-insensitive).
+ * Returns the member's profile data or null if not found.
+ */
+async function lookupDiscordMember(username) {
+  if (!DISCORD_BOT_TOKEN || !DISCORD_GUILD_ID) {
+    return { error: 'Discord verification is not configured.' };
+  }
+  const url = `https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/members/search?query=${encodeURIComponent(username)}&limit=100`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    console.error('Discord API error:', res.status, text);
+    return { error: `Discord API returned ${res.status}` };
+  }
+  const members = await res.json();
+  const match = members.find(
+    (m) => m.user?.username?.toLowerCase() === username.toLowerCase(),
+  );
+  if (!match) return { notInServer: true };
+  const u = match.user;
+  const avatarUrl = u.avatar
+    ? `https://cdn.discordapp.com/avatars/${u.id}/${u.avatar}.png?size=128`
+    : `https://cdn.discordapp.com/embed/avatars/${(BigInt(u.id) >> 22n) % 6n}.png`;
+  return {
+    member: {
+      id: u.id,
+      username: u.username,
+      displayName: match.nick || u.global_name || u.username,
+      avatarUrl,
+      accountCreated: snowflakeToDate(u.id),
+      joinedServer: match.joined_at ? new Date(match.joined_at) : null,
+    },
+  };
+}
+
 const app = express();
 app.use(cors({ origin: true, credentials: true }));
-// Accept both application/json and text/plain bodies (frontend uses text/plain
-// to avoid CORS preflight requests).
 app.use(express.json({ type: ['application/json', 'text/plain'] }));
 
 function requireAdmin(req, res, next) {
@@ -66,6 +120,7 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+// ========== Admin ==========
 app.get('/api/admin/codes', requireAdmin, async (_req, res) => {
   res.json(await AccessCode.find().sort({ createdAt: -1 }).lean());
 });
@@ -115,24 +170,72 @@ app.post('/api/admin/paused', requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
+// ========== Public ==========
 app.get('/api/status', async (_req, res) => {
   const doc = await Settings.findOne({ key: 'paused' }).lean();
   res.json({ paused: doc?.value === true });
 });
+
+// Verify a Discord username against the configured server
+app.post('/api/discord/verify', async (req, res) => {
+  const username = String(req.body?.username || '').trim().toLowerCase();
+  if (!username) { res.status(400).json({ ok: false, error: 'Missing username' }); return; }
+  try {
+    const result = await lookupDiscordMember(username);
+    if (result.error) { res.status(500).json({ ok: false, error: result.error }); return; }
+    if (result.notInServer) {
+      res.status(404).json({ ok: false, error: 'User not found in the Discord server. Make sure you joined first.' });
+      return;
+    }
+    res.json({ ok: true, member: result.member });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message || 'Verification failed' });
+  }
+});
+
 app.post('/api/claim', async (req, res) => {
   const { code: rawCode, discordUsername } = req.body || {};
   if (!rawCode || !discordUsername) { res.status(400).json({ ok: false, error: 'Missing code or discord username' }); return; }
   const code = String(rawCode).trim().toUpperCase();
+  const username = String(discordUsername).trim().toLowerCase();
+
+  // Verify Discord membership before claiming
+  const verification = await lookupDiscordMember(username);
+  if (verification.error) { res.status(500).json({ ok: false, error: verification.error }); return; }
+  if (verification.notInServer) {
+    res.status(403).json({ ok: false, error: 'You must be a member of the Discord server to claim a code.' });
+    return;
+  }
+  const member = verification.member;
+
   const found = await AccessCode.findOne({ code });
   if (!found) { res.status(400).json({ ok: false, error: 'Invalid access code.' }); return; }
   if (found.usedAt) { res.status(400).json({ ok: false, error: 'This code has already been used.' }); return; }
+
   found.usedAt = new Date();
-  found.discordUsername = String(discordUsername);
+  found.discordUsername = member.username;
+  found.discordId = member.id;
+  found.discordDisplayName = member.displayName;
+  found.discordAvatarUrl = member.avatarUrl;
+  found.discordAccountCreated = member.accountCreated;
+  found.discordJoinedServer = member.joinedServer;
   await found.save();
-  const session = await Session.create({ code, discordUsername: String(discordUsername), username: 'Guest', balance: 1000000 });
-  await log(code, discordUsername, 'claim', `Claimed code as @${discordUsername}`);
+
+  const session = await Session.create({
+    code,
+    discordUsername: member.username,
+    discordId: member.id,
+    discordDisplayName: member.displayName,
+    discordAvatarUrl: member.avatarUrl,
+    discordAccountCreated: member.accountCreated,
+    discordJoinedServer: member.joinedServer,
+    username: 'Guest',
+    balance: 1000000,
+  });
+  await log(code, member.username, 'claim', `Claimed code as @${member.username} (${member.displayName})`);
   res.json({ ok: true, session: session.toObject() });
 });
+
 app.get('/api/session/:code', async (req, res) => {
   const s = await Session.findOne({ code: req.params.code });
   if (!s) { res.status(404).json({ error: 'Session not found' }); return; }
