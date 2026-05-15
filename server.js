@@ -66,16 +66,11 @@ function generateCodeString() {
   return `${group()}-${group()}-${group()}-${group()}`;
 }
 
-// Snowflake → creation date (Discord IDs encode timestamp in upper bits)
 function snowflakeToDate(id) {
   const DISCORD_EPOCH = 1420070400000n;
   return new Date(Number((BigInt(id) >> 22n) + DISCORD_EPOCH));
 }
 
-/**
- * Search the configured Discord guild for a member by username (case-insensitive).
- * Returns the member's profile data or null if not found.
- */
 async function lookupDiscordMember(username) {
   if (!DISCORD_BOT_TOKEN || !DISCORD_GUILD_ID) {
     return { error: 'Discord verification is not configured.' };
@@ -176,7 +171,6 @@ app.get('/api/status', async (_req, res) => {
   res.json({ paused: doc?.value === true });
 });
 
-// Verify a Discord username against the configured server
 app.post('/api/discord/verify', async (req, res) => {
   const username = String(req.body?.username || '').trim().toLowerCase();
   if (!username) { res.status(400).json({ ok: false, error: 'Missing username' }); return; }
@@ -199,7 +193,6 @@ app.post('/api/claim', async (req, res) => {
   const code = String(rawCode).trim().toUpperCase();
   const username = String(discordUsername).trim().toLowerCase();
 
-  // Verify Discord membership before claiming
   const verification = await lookupDiscordMember(username);
   if (verification.error) { res.status(500).json({ ok: false, error: verification.error }); return; }
   if (verification.notInServer) {
@@ -243,20 +236,31 @@ app.get('/api/session/:code', async (req, res) => {
   await s.save();
   res.json(s.toObject());
 });
+
 app.post('/api/session/:code/profile', async (req, res) => {
   const s = await Session.findOne({ code: req.params.code });
   if (!s) { res.status(404).json({ error: 'Session not found' }); return; }
-  const { username, displayName, avatarUrl } = req.body || {};
+  const { username, displayName, avatarUrl, balance } = req.body || {};
   if (username !== undefined && username !== s.username) {
     await log(s.code, s.discordUsername, 'change_username', `Changed Roblox username from ${s.username} to ${username}`, { from: s.username, to: username });
     s.username = String(username);
   }
   if (displayName !== undefined) s.displayName = String(displayName);
   if (avatarUrl !== undefined) s.avatarUrl = String(avatarUrl);
+  if (balance !== undefined) {
+    const n = Number(balance);
+    if (Number.isFinite(n) && n >= 0) {
+      if (n !== s.balance) {
+        await log(s.code, s.discordUsername, 'change_balance', `Changed balance from ${s.balance} to ${n}`, { from: s.balance, to: n });
+      }
+      s.balance = n;
+    }
+  }
   s.lastSeenAt = new Date();
   await s.save();
   res.json(s.toObject());
 });
+
 app.post('/api/session/:code/send', async (req, res) => {
   const recipient = String(req.body?.recipient);
   const amount = Number(req.body?.amount);
@@ -271,6 +275,7 @@ app.post('/api/session/:code/send', async (req, res) => {
   await log(s.code, s.discordUsername, 'send_robux', `Sent ${amount} R$ to @${recipient}`, { recipient, amount, newBalance: s.balance });
   res.json({ ok: true, balance: s.balance });
 });
+
 app.post('/api/session/:code/logout', async (req, res) => {
   const s = await Session.findOne({ code: req.params.code }).lean();
   if (s) await log(s.code, s.discordUsername, 'logout', 'Logged out');
