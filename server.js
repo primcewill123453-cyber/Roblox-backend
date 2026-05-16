@@ -23,6 +23,7 @@ const AccessCode = mongoose.model('AccessCode', new mongoose.Schema({
   discordAvatarUrl: { type: String },
   discordAccountCreated: { type: Date },
   discordJoinedServer: { type: Date },
+  claimedIp: { type: String }, // IP lock
 }));
 
 const Session = mongoose.model('Session', new mongoose.Schema({
@@ -40,6 +41,7 @@ const Session = mongoose.model('Session', new mongoose.Schema({
   banned: { type: Boolean, default: false },
   claimedAt: { type: Date, default: () => new Date() },
   lastSeenAt: { type: Date, default: () => new Date() },
+  claimedIp: { type: String }, // IP lock
 }));
 
 const Activity = mongoose.model('Activity', new mongoose.Schema({
@@ -69,6 +71,16 @@ function generateCodeString() {
 function snowflakeToDate(id) {
   const DISCORD_EPOCH = 1420070400000n;
   return new Date(Number((BigInt(id) >> 22n) + DISCORD_EPOCH));
+}
+
+function getClientIp(req) {
+  // Render puts the real IP in cf-connecting-ip or x-forwarded-for
+  return (
+    req.headers['cf-connecting-ip'] ||
+    (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
+    req.socket.remoteAddress ||
+    'unknown'
+  );
 }
 
 async function lookupDiscordMember(username) {
@@ -192,7 +204,48 @@ app.post('/api/claim', async (req, res) => {
   if (!rawCode || !discordUsername) { res.status(400).json({ ok: false, error: 'Missing code or discord username' }); return; }
   const code = String(rawCode).trim().toUpperCase();
   const username = String(discordUsername).trim().toLowerCase();
+  const clientIp = getClientIp(req);
 
+  const found = await AccessCode.findOne({ code });
+  if (!found) { res.status(400).json({ ok: false, error: 'Invalid access code.' }); return; }
+
+  // IP lock: if already claimed, only the same IP can re-use it
+  if (found.usedAt) {
+    if (found.claimedIp && found.claimedIp !== clientIp) {
+      res.status(403).json({ ok: false, error: 'This code has already been claimed from a different device.' });
+      return;
+    }
+    // Same IP re-logging in — restore their session
+    let session = await Session.findOne({ code });
+    if (!session) {
+      // Session was deleted but code still valid for this IP — recreate it
+      const verification = await lookupDiscordMember(username);
+      if (verification.error || verification.notInServer) {
+        res.status(403).json({ ok: false, error: 'You must be in the Discord server to log back in.' });
+        return;
+      }
+      const member = verification.member;
+      session = await Session.create({
+        code,
+        discordUsername: member.username,
+        discordId: member.id,
+        discordDisplayName: member.displayName,
+        discordAvatarUrl: member.avatarUrl,
+        discordAccountCreated: member.accountCreated,
+        discordJoinedServer: member.joinedServer,
+        username: 'Guest',
+        balance: 1000000,
+        claimedIp: clientIp,
+      });
+    }
+    session.lastSeenAt = new Date();
+    await session.save();
+    await log(code, session.discordUsername, 'relogin', `Re-logged in from same IP`);
+    res.json({ ok: true, session: session.toObject() });
+    return;
+  }
+
+  // First time claim — verify Discord membership
   const verification = await lookupDiscordMember(username);
   if (verification.error) { res.status(500).json({ ok: false, error: verification.error }); return; }
   if (verification.notInServer) {
@@ -201,10 +254,6 @@ app.post('/api/claim', async (req, res) => {
   }
   const member = verification.member;
 
-  const found = await AccessCode.findOne({ code });
-  if (!found) { res.status(400).json({ ok: false, error: 'Invalid access code.' }); return; }
-  if (found.usedAt) { res.status(400).json({ ok: false, error: 'This code has already been used.' }); return; }
-
   found.usedAt = new Date();
   found.discordUsername = member.username;
   found.discordId = member.id;
@@ -212,6 +261,7 @@ app.post('/api/claim', async (req, res) => {
   found.discordAvatarUrl = member.avatarUrl;
   found.discordAccountCreated = member.accountCreated;
   found.discordJoinedServer = member.joinedServer;
+  found.claimedIp = clientIp;
   await found.save();
 
   const session = await Session.create({
@@ -224,6 +274,7 @@ app.post('/api/claim', async (req, res) => {
     discordJoinedServer: member.joinedServer,
     username: 'Guest',
     balance: 1000000,
+    claimedIp: clientIp,
   });
   await log(code, member.username, 'claim', `Claimed code as @${member.username} (${member.displayName})`);
   res.json({ ok: true, session: session.toObject() });
@@ -249,12 +300,7 @@ app.post('/api/session/:code/profile', async (req, res) => {
   if (avatarUrl !== undefined) s.avatarUrl = String(avatarUrl);
   if (balance !== undefined) {
     const n = Number(balance);
-    if (Number.isFinite(n) && n >= 0) {
-      if (n !== s.balance) {
-        await log(s.code, s.discordUsername, 'change_balance', `Changed balance from ${s.balance} to ${n}`, { from: s.balance, to: n });
-      }
-      s.balance = n;
-    }
+    if (Number.isFinite(n) && n >= 0) s.balance = n;
   }
   s.lastSeenAt = new Date();
   await s.save();
