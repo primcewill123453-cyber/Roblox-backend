@@ -1,336 +1,280 @@
 import express from 'express';
-import cors from 'cors';
-import mongoose from 'mongoose';
+import { MongoClient } from 'mongodb';
+import { Client, GatewayIntentBits, Partials } from 'discord.js';
 
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'PRINCE-ADMIN-2025';
-const MONGO_URL = process.env.MONGO_URL;
-const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
-const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID;
-const PORT = Number(process.env.PORT) || 3000;
+// ============================================================
+// MONGODB STORE
+// ============================================================
+const MONGODB_URL = process.env.MONGODB_URL || 'mongodb+srv://Prince:princewill@cluster0.ybmwcbx.mongodb.net/roblox-clone?appName=Cluster0';
+let db = null;
 
-if (!MONGO_URL) {
-  console.error('MONGO_URL env var is not set');
-  process.exit(1);
-}
-
-const AccessCode = mongoose.model('AccessCode', new mongoose.Schema({
-  code: { type: String, required: true, unique: true, index: true },
-  createdAt: { type: Date, default: () => new Date() },
-  usedAt: { type: Date },
-  discordUsername: { type: String },
-  discordId: { type: String },
-  discordDisplayName: { type: String },
-  discordAvatarUrl: { type: String },
-  discordAccountCreated: { type: Date },
-  discordJoinedServer: { type: Date },
-  claimedIp: { type: String }, // IP lock
-}));
-
-const Session = mongoose.model('Session', new mongoose.Schema({
-  code: { type: String, required: true, unique: true, index: true },
-  discordUsername: { type: String, required: true, index: true },
-  discordId: { type: String, index: true },
-  discordDisplayName: { type: String },
-  discordAvatarUrl: { type: String },
-  discordAccountCreated: { type: Date },
-  discordJoinedServer: { type: Date },
-  username: { type: String, default: 'Guest' },
-  displayName: { type: String },
-  balance: { type: Number, default: 1000000 },
-  avatarUrl: { type: String },
-  banned: { type: Boolean, default: false },
-  claimedAt: { type: Date, default: () => new Date() },
-  lastSeenAt: { type: Date, default: () => new Date() },
-  claimedIp: { type: String }, // IP lock
-}));
-
-const Activity = mongoose.model('Activity', new mongoose.Schema({
-  code: { type: String, required: true, index: true },
-  discordUsername: { type: String, required: true, index: true },
-  type: { type: String, required: true },
-  message: { type: String, required: true },
-  details: { type: mongoose.Schema.Types.Mixed },
-  at: { type: Date, default: () => new Date(), index: true },
-}));
-
-const Settings = mongoose.model('Settings', new mongoose.Schema({
-  key: { type: String, required: true, unique: true },
-  value: { type: mongoose.Schema.Types.Mixed, required: true },
-}));
-
-async function log(code, discordUsername, type, message, details) {
-  await Activity.create({ code, discordUsername, type, message, details });
-}
-
-function generateCodeString() {
-  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const group = () => Array.from({ length: 4 }, () => alphabet.charAt(Math.floor(Math.random() * alphabet.length))).join('');
-  return `${group()}-${group()}-${group()}-${group()}`;
-}
-
-function snowflakeToDate(id) {
-  const DISCORD_EPOCH = 1420070400000n;
-  return new Date(Number((BigInt(id) >> 22n) + DISCORD_EPOCH));
-}
-
-function getClientIp(req) {
-  // Render puts the real IP in cf-connecting-ip or x-forwarded-for
-  return (
-    req.headers['cf-connecting-ip'] ||
-    (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
-    req.socket.remoteAddress ||
-    'unknown'
-  );
-}
-
-async function lookupDiscordMember(username) {
-  if (!DISCORD_BOT_TOKEN || !DISCORD_GUILD_ID) {
-    return { error: 'Discord verification is not configured.' };
-  }
-  const url = `https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/members/search?query=${encodeURIComponent(username)}&limit=100`;
-  const res = await fetch(url, {
-    headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` },
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    console.error('Discord API error:', res.status, text);
-    return { error: `Discord API returned ${res.status}` };
-  }
-  const members = await res.json();
-  const match = members.find(
-    (m) => m.user?.username?.toLowerCase() === username.toLowerCase(),
-  );
-  if (!match) return { notInServer: true };
-  const u = match.user;
-  const avatarUrl = u.avatar
-    ? `https://cdn.discordapp.com/avatars/${u.id}/${u.avatar}.png?size=128`
-    : `https://cdn.discordapp.com/embed/avatars/${(BigInt(u.id) >> 22n) % 6n}.png`;
-  return {
-    member: {
-      id: u.id,
-      username: u.username,
-      displayName: match.nick || u.global_name || u.username,
-      avatarUrl,
-      accountCreated: snowflakeToDate(u.id),
-      joinedServer: match.joined_at ? new Date(match.joined_at) : null,
-    },
-  };
-}
-
-const app = express();
-app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ type: ['application/json', 'text/plain'] }));
-
-function requireAdmin(req, res, next) {
-  const secret = req.headers['x-admin-secret'] || req.query.secret;
-  if (secret !== ADMIN_SECRET) { res.status(401).json({ error: 'Unauthorized' }); return; }
-  next();
-}
-
-// ========== Admin ==========
-app.get('/api/admin/codes', requireAdmin, async (_req, res) => {
-  res.json(await AccessCode.find().sort({ createdAt: -1 }).lean());
-});
-app.post('/api/admin/codes', requireAdmin, async (_req, res) => {
-  const code = generateCodeString();
-  await AccessCode.create({ code });
-  res.json({ code });
-});
-app.delete('/api/admin/codes/:code', requireAdmin, async (req, res) => {
-  await AccessCode.deleteOne({ code: req.params.code });
-  await Session.deleteOne({ code: req.params.code });
-  res.json({ ok: true });
-});
-app.get('/api/admin/sessions', requireAdmin, async (_req, res) => {
-  res.json(await Session.find().sort({ lastSeenAt: -1 }).lean());
-});
-app.post('/api/admin/sessions/:code/balance', requireAdmin, async (req, res) => {
-  const balance = Number(req.body?.balance);
-  if (!Number.isFinite(balance) || balance < 0) { res.status(400).json({ error: 'Invalid balance' }); return; }
-  const s = await Session.findOne({ code: req.params.code });
-  if (s) {
-    s.balance = balance;
-    await s.save();
-    await log(s.code, s.discordUsername, 'admin_balance', `Admin set balance to ${balance}`, { balance });
-  }
-  res.json({ ok: true });
-});
-app.post('/api/admin/sessions/:code/ban', requireAdmin, async (req, res) => {
-  const banned = !!req.body?.banned;
-  const s = await Session.findOne({ code: req.params.code });
-  if (s) {
-    s.banned = banned;
-    await s.save();
-    await log(s.code, s.discordUsername, banned ? 'ban' : 'unban', banned ? 'Admin banned user' : 'Admin unbanned user');
-  }
-  res.json({ ok: true });
-});
-app.get('/api/admin/activity', requireAdmin, async (req, res) => {
-  res.json(await Activity.find().sort({ at: -1 }).limit(Math.min(Number(req.query.limit) || 200, 500)).lean());
-});
-app.get('/api/admin/paused', requireAdmin, async (_req, res) => {
-  const doc = await Settings.findOne({ key: 'paused' }).lean();
-  res.json({ paused: doc?.value === true });
-});
-app.post('/api/admin/paused', requireAdmin, async (req, res) => {
-  await Settings.updateOne({ key: 'paused' }, { $set: { value: !!req.body?.paused } }, { upsert: true });
-  res.json({ ok: true });
-});
-
-// ========== Public ==========
-app.get('/api/status', async (_req, res) => {
-  const doc = await Settings.findOne({ key: 'paused' }).lean();
-  res.json({ paused: doc?.value === true });
-});
-
-app.post('/api/discord/verify', async (req, res) => {
-  const username = String(req.body?.username || '').trim().toLowerCase();
-  if (!username) { res.status(400).json({ ok: false, error: 'Missing username' }); return; }
+async function connectDB() {
   try {
-    const result = await lookupDiscordMember(username);
-    if (result.error) { res.status(500).json({ ok: false, error: result.error }); return; }
-    if (result.notInServer) {
-      res.status(404).json({ ok: false, error: 'User not found in the Discord server. Make sure you joined first.' });
-      return;
-    }
-    res.json({ ok: true, member: result.member });
+    const client = new MongoClient(MONGODB_URL);
+    await client.connect();
+    db = client.db('roblox-clone');
+    console.log('✅ MongoDB connected');
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message || 'Verification failed' });
+    console.error('MongoDB connection failed:', e?.message || e);
   }
-});
+}
 
-app.post('/api/claim', async (req, res) => {
-  const { code: rawCode, discordUsername } = req.body || {};
-  if (!rawCode || !discordUsername) { res.status(400).json({ ok: false, error: 'Missing code or discord username' }); return; }
-  const code = String(rawCode).trim().toUpperCase();
-  const username = String(discordUsername).trim().toLowerCase();
-  const clientIp = getClientIp(req);
+async function getState() {
+  if (!db) return { paused: false, sitePassword: '', keys: [] };
+  const doc = await db.collection('state').findOne({ _id: 'main' });
+  return doc || { paused: false, sitePassword: '', keys: [] };
+}
 
-  const found = await AccessCode.findOne({ code });
-  if (!found) { res.status(400).json({ ok: false, error: 'Invalid access code.' }); return; }
+async function saveState(state) {
+  if (!db) return;
+  await db.collection('state').replaceOne({ _id: 'main' }, { _id: 'main', ...state }, { upsert: true });
+}
 
-  // IP lock: if already claimed, only the same IP can re-use it
-  if (found.usedAt) {
-    if (found.claimedIp && found.claimedIp !== clientIp) {
-      res.status(403).json({ ok: false, error: 'This code has already been claimed from a different device.' });
-      return;
-    }
-    // Same IP re-logging in — restore their session
-    let session = await Session.findOne({ code });
-    if (!session) {
-      // Session was deleted but code still valid for this IP — recreate it
-      const verification = await lookupDiscordMember(username);
-      if (verification.error || verification.notInServer) {
-        res.status(403).json({ ok: false, error: 'You must be in the Discord server to log back in.' });
-        return;
+function generateCode() {
+  const part = () => Math.random().toString(36).slice(2, 6).toUpperCase().padEnd(4, 'X');
+  return `${part()}-${part()}-${part()}-${part()}`;
+}
+
+const Store = {
+  get: async () => getState(),
+  async setPaused(paused) {
+    const s = await getState();
+    s.paused = paused;
+    await saveState(s);
+  },
+  async createKey(durationMs) {
+    const s = await getState();
+    const key = {
+      code: generateCode(),
+      createdAt: Date.now(),
+      expiresAt: durationMs === Number.MAX_SAFE_INTEGER ? Number.MAX_SAFE_INTEGER : Date.now() + durationMs,
+      paused: false,
+    };
+    s.keys.unshift(key);
+    await saveState(s);
+    return key;
+  },
+  async deleteKey(code) {
+    const s = await getState();
+    s.keys = s.keys.filter((k) => k.code !== code);
+    await saveState(s);
+  },
+  async clearKeys() {
+    const s = await getState();
+    s.keys = [];
+    await saveState(s);
+  },
+  async setKeyPaused(code, paused) {
+    const s = await getState();
+    const key = s.keys.find((k) => k.code.toLowerCase() === code.toLowerCase());
+    if (key) { key.paused = paused; await saveState(s); }
+    return { ok: !!key };
+  },
+  async claimKey(code, ip, discord, discordInfo) {
+    const s = await getState();
+    const key = s.keys.find((k) => k.code.toLowerCase() === code.toLowerCase());
+    if (!key) return { ok: false, reason: 'Invalid key.' };
+    if (key.paused) return { ok: false, reason: 'Key is paused.' };
+    if (key.expiresAt < Date.now()) return { ok: false, reason: 'Key expired.' };
+    if (key.claimedByIp) {
+      // Same IP — let them back in
+      if (key.claimedByIp === ip) return { ok: true, key };
+      // Same Discord username — IP changed, update and let back in
+      if (key.claimedByDiscord && discord &&
+          key.claimedByDiscord.toLowerCase() === discord.toLowerCase()) {
+        key.claimedByIp = ip;
+        await saveState(s);
+        return { ok: true, key };
       }
-      const member = verification.member;
-      session = await Session.create({
-        code,
-        discordUsername: member.username,
-        discordId: member.id,
-        discordDisplayName: member.displayName,
-        discordAvatarUrl: member.avatarUrl,
-        discordAccountCreated: member.accountCreated,
-        discordJoinedServer: member.joinedServer,
-        username: 'Guest',
-        balance: 1000000,
-        claimedIp: clientIp,
-      });
+      return { ok: false, reason: 'Key already claimed.' };
     }
-    session.lastSeenAt = new Date();
-    await session.save();
-    await log(code, session.discordUsername, 'relogin', `Re-logged in from same IP`);
-    res.json({ ok: true, session: session.toObject() });
-    return;
-  }
+    key.claimedByIp = ip;
+    key.claimedByDiscord = discord;
+    key.discordInfo = discordInfo || null;
+    key.claimedAt = Date.now();
+    await saveState(s);
+    return { ok: true, key };
+  },
+  async isIpUnlocked(ip) {
+    const s = await getState();
+    return s.keys.some((k) => k.claimedByIp === ip && k.expiresAt > Date.now() && !k.paused);
+  },
+  async ipKeyStatus(ip) {
+    const s = await getState();
+    const key = s.keys.find((k) => k.claimedByIp === ip);
+    if (!key) return 'none';
+    if (key.paused) return 'paused';
+    if (key.expiresAt < Date.now()) return 'expired';
+    return 'unlocked';
+  },
+};
 
-  // First time claim — verify Discord membership
-  const verification = await lookupDiscordMember(username);
-  if (verification.error) { res.status(500).json({ ok: false, error: verification.error }); return; }
-  if (verification.notInServer) {
-    res.status(403).json({ ok: false, error: 'You must be a member of the Discord server to claim a code.' });
-    return;
-  }
-  const member = verification.member;
+// ============================================================
+// DISCORD BOT
+// ============================================================
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID;
+const CODE_KEYWORD = (process.env.DISCORD_CODE_KEYWORD || 'PRX').toUpperCase();
 
-  found.usedAt = new Date();
-  found.discordUsername = member.username;
-  found.discordId = member.id;
-  found.discordDisplayName = member.displayName;
-  found.discordAvatarUrl = member.avatarUrl;
-  found.discordAccountCreated = member.accountCreated;
-  found.discordJoinedServer = member.joinedServer;
-  found.claimedIp = clientIp;
-  await found.save();
+let discordReady = false;
+let discordClient = null;
 
-  const session = await Session.create({
-    code,
-    discordUsername: member.username,
-    discordId: member.id,
-    discordDisplayName: member.displayName,
-    discordAvatarUrl: member.avatarUrl,
-    discordAccountCreated: member.accountCreated,
-    discordJoinedServer: member.joinedServer,
-    username: 'Guest',
-    balance: 1000000,
-    claimedIp: clientIp,
+if (DISCORD_TOKEN && DISCORD_GUILD_ID) {
+  discordClient = new Client({
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildPresences],
+    partials: [Partials.GuildMember, Partials.User],
   });
-  await log(code, member.username, 'claim', `Claimed code as @${member.username} (${member.displayName})`);
-  res.json({ ok: true, session: session.toObject() });
-});
+  discordClient.once('ready', () => { discordReady = true; console.log(`🤖 Discord bot ready as ${discordClient.user.tag}`); });
+  discordClient.on('error', (e) => console.error('Discord error:', e?.message || e));
+  discordClient.login(DISCORD_TOKEN).catch((e) => console.error('Discord login failed:', e?.message || e));
+}
 
-app.get('/api/session/:code', async (req, res) => {
-  const s = await Session.findOne({ code: req.params.code });
-  if (!s) { res.status(404).json({ error: 'Session not found' }); return; }
-  s.lastSeenAt = new Date();
-  await s.save();
-  res.json(s.toObject());
-});
-
-app.post('/api/session/:code/profile', async (req, res) => {
-  const s = await Session.findOne({ code: req.params.code });
-  if (!s) { res.status(404).json({ error: 'Session not found' }); return; }
-  const { username, displayName, avatarUrl, balance } = req.body || {};
-  if (username !== undefined && username !== s.username) {
-    await log(s.code, s.discordUsername, 'change_username', `Changed Roblox username from ${s.username} to ${username}`, { from: s.username, to: username });
-    s.username = String(username);
+async function lookupDiscordUser(rawUsername) {
+  const q = (rawUsername || '').trim().replace(/^@/, '').toLowerCase();
+  if (!q) return { found: false, reason: 'no username' };
+  if (!discordReady || !discordClient) return { found: false, reason: 'bot offline' };
+  let guild;
+  try { guild = await discordClient.guilds.fetch(DISCORD_GUILD_ID); } catch (e) { return { found: false, reason: 'guild fetch failed' }; }
+  let member = null;
+  try {
+    const results = await guild.members.search({ query: q, limit: 10 });
+    member = results.find((m) => {
+      const u = m.user;
+      return u.username?.toLowerCase() === q || u.globalName?.toLowerCase() === q || m.displayName?.toLowerCase() === q;
+    }) || results.first();
+  } catch (e) { console.error('members.search failed:', e?.message); }
+  if (!member) {
+    try {
+      await guild.members.fetch({ withPresences: true });
+      const names = (m) => [m.user.username, m.user.globalName, m.displayName].filter(Boolean).map((n) => n.toLowerCase());
+      member = guild.members.cache.find((m) => names(m).some((n) => n === q))
+        || guild.members.cache.find((m) => names(m).some((n) => n.startsWith(q)))
+        || guild.members.cache.find((m) => names(m).some((n) => n.includes(q)));
+    } catch (e) { console.error('members.fetch failed:', e?.message); }
   }
-  if (displayName !== undefined) s.displayName = String(displayName);
-  if (avatarUrl !== undefined) s.avatarUrl = String(avatarUrl);
-  if (balance !== undefined) {
-    const n = Number(balance);
-    if (Number.isFinite(n) && n >= 0) s.balance = n;
+  if (!member) return { found: false, reason: 'not in server', inServer: false };
+  try {
+    const user = member.user;
+    const avatarUrl = member.displayAvatarURL?.({ size: 128, extension: 'png' }) || '';
+    let customStatus = '';
+    const presence = member.presence;
+    if (presence?.activities?.length) {
+      const custom = presence.activities.find((a) => a.type === 4);
+      customStatus = custom?.state || presence.activities[0]?.state || presence.activities[0]?.name || '';
+    }
+    return { found: true, inServer: true, id: user.id, username: user.username || '', displayName: member.displayName || user.globalName || user.username || '', avatarUrl, status: presence?.status || 'offline', customStatus, usesCode: customStatus.toUpperCase().includes(CODE_KEYWORD) };
+  } catch (e) { return { found: false, reason: 'member processing failed' }; }
+}
+
+// ============================================================
+// SERVER
+// ============================================================
+const app = express();
+app.use(express.json());
+app.use((req, res, next) => {
+  const origin = req.headers.origin || '*';
+  res.header('Access-Control-Allow-Origin', origin);
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+function getIp(req) {
+  return ((req.headers['x-forwarded-for'] || '').toString().split(',')[0]?.trim()) || req.socket.remoteAddress || 'unknown';
+}
+
+app.get('/', (_req, res) => res.send(`Roblox clone backend up. Discord: ${discordReady ? 'ready' : 'offline'} | DB: ${db ? 'connected' : 'offline'}`));
+
+app.get('/status', async (_req, res) => {
+  const s = await Store.get();
+  res.json({ paused: s.paused, hasSitePassword: !!s.sitePassword, discord: discordReady, codeKeyword: CODE_KEYWORD });
+});
+
+app.get('/check', async (req, res) => {
+  res.json({ unlocked: await Store.isIpUnlocked(getIp(req)), status: await Store.ipKeyStatus(getIp(req)) });
+});
+
+app.get('/discord/lookup', async (req, res) => {
+  res.json(await lookupDiscordUser((req.query.username || '').toString()));
+});
+
+app.post('/unlock', async (req, res) => {
+  const { code, discord, sitePassword } = req.body || {};
+  const s = await Store.get();
+  if (s.paused) return res.json({ ok: false, reason: 'Site is paused.' });
+  if (s.sitePassword && s.sitePassword !== (sitePassword || '')) return res.json({ ok: false, reason: 'Incorrect site password.' });
+  if (!discord?.trim()) return res.json({ ok: false, reason: 'Discord username required.' });
+  let discordInfo = null;
+  if (discordReady) {
+    discordInfo = await lookupDiscordUser(discord);
+    if (!discordInfo.found || !discordInfo.inServer) return res.json({ ok: false, reason: 'You must join our Discord server first.' });
   }
-  s.lastSeenAt = new Date();
-  await s.save();
-  res.json(s.toObject());
+  res.json(await Store.claimKey(code, getIp(req), discord, discordInfo));
 });
 
-app.post('/api/session/:code/send', async (req, res) => {
-  const recipient = String(req.body?.recipient);
-  const amount = Number(req.body?.amount);
-  const s = await Session.findOne({ code: req.params.code });
-  if (!s) { res.status(400).json({ ok: false, error: 'Session not found.' }); return; }
-  if (s.banned) { res.status(400).json({ ok: false, error: 'Your account is banned.' }); return; }
-  if (!Number.isFinite(amount) || amount <= 0) { res.status(400).json({ ok: false, error: 'Invalid amount.' }); return; }
-  if (amount > s.balance) { res.status(400).json({ ok: false, error: 'Not enough Robux.' }); return; }
-  s.balance -= amount;
-  s.lastSeenAt = new Date();
-  await s.save();
-  await log(s.code, s.discordUsername, 'send_robux', `Sent ${amount} R$ to @${recipient}`, { recipient, amount, newBalance: s.balance });
-  res.json({ ok: true, balance: s.balance });
+app.post('/users/search', async (req, res) => {
+  const kw = (req.body?.keyword || '').trim();
+  if (!kw) return res.json({ data: [] });
+  let results = [];
+  try { const r = await fetch(`https://users.roblox.com/v1/users/search?keyword=${encodeURIComponent(kw)}&limit=10`); results = (await r.json())?.data || []; } catch {}
+  if (!results.length) {
+    try {
+      const r = await fetch('https://users.roblox.com/v1/usernames/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ usernames: [kw], excludeBannedUsers: false }) });
+      results = ((await r.json())?.data || []).map((u) => ({ id: u.id, name: u.name, displayName: u.displayName }));
+    } catch {}
+  }
+  res.json({ data: results });
 });
 
-app.post('/api/session/:code/logout', async (req, res) => {
-  const s = await Session.findOne({ code: req.params.code }).lean();
-  if (s) await log(s.code, s.discordUsername, 'logout', 'Logged out');
+app.post('/users/headshots', async (req, res) => {
+  const { userIds } = req.body || {};
+  if (!userIds?.length) return res.json({ data: [] });
+  try { const r = await fetch(`https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${userIds.join(',')}&size=48x48&format=Png&isCircular=true`); res.json({ data: (await r.json())?.data || [] }); } catch { res.json({ data: [] }); }
+});
+
+app.get('/admin/state', async (_req, res) => {
+  const s = await Store.get();
+  res.json({ paused: s.paused, sitePassword: s.sitePassword, keys: s.keys, discord: discordReady, codeKeyword: CODE_KEYWORD });
+});
+
+app.post('/admin/keys', async (req, res) => {
+  res.json(await Store.createKey(Number(req.body?.durationMs) || 24 * 60 * 60 * 1000));
+});
+
+app.delete('/admin/keys/:code', async (req, res) => {
+  await Store.deleteKey(req.params.code);
   res.json({ ok: true });
 });
 
-mongoose.connect(MONGO_URL).then(() => {
-  app.listen(PORT, () => { console.log(`Robux backend ready on :${PORT}`); });
-}).catch((err) => {
-  console.error('Failed to connect to MongoDB:', err);
-  process.exit(1);
+app.post('/admin/clear-keys', async (_req, res) => {
+  await Store.clearKeys();
+  res.json({ ok: true });
+});
+
+app.post('/admin/keys/:code/pause', async (req, res) => {
+  res.json(await Store.setKeyPaused(req.params.code, !!req.body?.paused));
+});
+
+app.post('/admin/pause', async (req, res) => {
+  await Store.setPaused(!!req.body?.paused);
+  res.json({ ok: true });
+});
+
+app.post('/admin/refresh-discord', async (_req, res) => {
+  const s = await Store.get();
+  for (const k of s.keys) {
+    if (k.claimedByDiscord) {
+      const info = await lookupDiscordUser(k.claimedByDiscord);
+      if (info.found) k.discordInfo = info;
+    }
+  }
+  await saveState(s);
+  res.json({ ok: true, keys: s.keys });
+});
+
+const port = process.env.PORT || 3000;
+connectDB().then(() => {
+  app.listen(port, () => console.log(`🚀 Roblox backend on :${port}`));
 });
